@@ -1,0 +1,2 @@
+// Добавить меня в группу docker
+sudo usermod -aG docker $USER
