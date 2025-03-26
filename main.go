@@ -1,89 +1,245 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"vk_tarantool/Internal/application"
+	"vk_tarantool/Internal/config"
+	"vk_tarantool/Internal/handlers/pool"
 
 	mattermost "github.com/mattermost/mattermost-server/v6/model"
 )
 
-// MM_TEAM="test"
-// MM_TOKEN="ritzg6x5f38c8jkmbzxsjjy81o"
-// MM_CHANNEL="town-square"
-// MM_SERVER="http://localhost:8065"
-// MM_USERNAME="test-bot"
-
 func main() {
-	// Новый клиент Mattermost
-	url := `http://localhost:8065`
-	token := `ritzg6x5f38c8jkmbzxsjjy81o`
-	team_name := "newTeam"
-	client := mattermost.NewAPIv4Client(url)
-	client.SetToken(token)
-	var user *mattermost.User
-	if u, _, err := client.GetUser("me", ""); err != nil {
-		// app.logger.Fatal().Err(err).Msg("Could not log in")
-		log.Println("Could not log in")
-		log.Fatal(err)
+	app := application.New()
+	app.Logger.Info("starting bot")
+	app.Logger.Debug("debug massages enabled")
+
+	app.Config = config.MustLoad("./Config/conf.yaml")
+
+	app.Client = mattermost.NewAPIv4Client(app.Config.MM_SERVER)
+	app.Client.SetToken(app.Config.MM_TOKEN)
+	if user, resp, err := app.Client.GetUser("me", ""); err != nil {
+		app.Logger.Error("Could not log in", slog.Attr{
+			Key:   "error",
+			Value: slog.StringValue(err.Error()),
+		})
+		os.Exit(1)
 	} else {
-		user = u
-		log.Printf("user %s logged in mattermost", user.FirstName)
+		app.Logger.Debug("success log in", slog.String("Name:", user.FirstName), slog.String("status code", strconv.Itoa(resp.StatusCode)))
+		app.Logger.Info("bot logged in mattermost", slog.String("Name:", user.FirstName))
+		app.User = user
 	}
 
 	// Find and save the bot's team to app struct.
-	var team *mattermost.Team
-	if t, _, err := client.GetTeamByName(team_name, ""); err != nil {
-		log.Printf("Could not find %s team. Is this bot a member ?", team_name)
-		log.Fatal(err)
+	if team, resp, err := app.Client.GetTeamByName(app.Config.MM_TEAM, ""); err != nil {
+		app.Logger.Error("Could not find team. Is this bot a member?",
+			slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			},
+			slog.String("Bot:", app.User.FirstName), slog.String("Team:", app.Config.MM_TEAM))
+		os.Exit(1)
 	} else {
-		team = t
-		log.Printf("Team %s was founded\n", team.Name)
+		app.Logger.Debug("success find team", slog.String("Team:", team.Name), slog.String("status code", strconv.Itoa(resp.StatusCode)))
+		app.Logger.Info("success find team", slog.String("Team:", team.Name))
+		app.Team = team
 	}
 
-	// teams, _, err := client.GetAllTeams("", 0, 100) // 100 - максимальное количество
-	// if err != nil {
-	// 	log.Fatalf("Ошибка при получении списка команд: %v", err)
-	// }
-
-	// // Вывод информации о командах
-	// fmt.Println("Доступные команды (teams):")
-	// for _, team := range teams {
-	// 	fmt.Printf("ID: %s, Имя: %s, Отображаемое имя: %s\n",
-	// 		team.Id,
-	// 		team.Name,
-	// 		team.DisplayName)
-	// }
-
-	var channel *mattermost.Channel
-	channelName := "town-square"
-	if c, _, err := client.GetChannelByName(channelName, team.Id, ""); err != nil {
-		log.Printf("Could not find %s channel in team %s. Is this bot a member ?", channelName, team_name)
-		log.Fatal(err)
+	if ch, resp, err := app.Client.GetChannelByName(app.Config.MM_CHANNEL, app.Team.Id, ""); err != nil {
+		app.Logger.Error("Could not find channel in team. Is this bot a member?",
+			slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			},
+			slog.String("Bot:", app.User.FirstName), slog.String("Team:", app.Config.MM_TEAM),
+			slog.String("Channel:", app.Config.MM_CHANNEL))
+		os.Exit(1)
 	} else {
-		channel = c
-		log.Printf("Channel %s was founded\n", channel.Name)
+		app.Logger.Debug("success find channel", slog.String("Team:", app.Team.Name),
+			slog.String("Channel:", ch.Name), slog.String("status code", strconv.Itoa(resp.StatusCode)))
+		app.Logger.Info("success find channel", slog.String("Chanel:", ch.Name))
+		app.Channel = ch
 	}
+	setupGracefulShutdown(app)
+	registerSlashCommand(app, "pool")
+	sendMsgToChan(app, "Hello!")
+	http.HandleFunc("/pool/", pool.New(app))
+	if err := http.ListenAndServe("localhost:8080", nil); err != nil {
+		log.Fatal(err)
+	}
+	// listenToEvents(app)
+}
 
-	post := &mattermost.Post{
-		ChannelId: channel.Id,
-		Message:   "How are you?",
-	}
-	_, _, err := client.CreatePost(post)
+func listenToEvents(app *application.Application) {
+	failCount := 0
+	path, err := url.Parse(app.Config.MM_SERVER)
 	if err != nil {
-		log.Println(err)
+		app.Logger.Error("Could not parse url!",
+			slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+	}
+	for {
+		app.WebsocketClient, err = mattermost.NewWebSocketClient4(
+			fmt.Sprintf("ws://%s", path.Host+path.Path),
+			app.Client.AuthToken,
+		)
+		if err != nil {
+			app.Logger.Error("Mattermost websocket disconnected, retrying")
+			failCount += 1
+			continue
+		}
+		app.Logger.Info("Mattermost websocket connected")
+
+		app.WebsocketClient.Listen()
+		for event := range app.WebsocketClient.EventChannel {
+			if event.GetBroadcast().ChannelId != app.Channel.Id {
+				continue
+			}
+			// Ignore other types of events.
+			if event.EventType() != mattermost.WebsocketEventPosted {
+				continue
+			}
+			// Ignore messages sent by this bot itself.
+			p := &mattermost.Post{}
+			err := json.Unmarshal([]byte(event.GetData()["post"].(string)), &p)
+			if err != nil {
+				app.Logger.Error("Error while marshaling post", slog.Attr{
+					Key:   "error",
+					Value: slog.StringValue(err.Error()),
+				})
+			}
+			if p.UserId == app.User.Id {
+				continue
+			}
+			if p.Message == "create pool" {
+				response := &mattermost.Post{
+					ChannelId: app.Channel.Id,
+					Message:   "**Опрос: Какой ваш любимый язык программирования?**",
+					Props: map[string]any{
+						"attachments": []*mattermost.SlackAttachment{
+							{
+								Actions: []*mattermost.PostAction{
+									{
+										Name: "Go",
+										Type: "button",
+										Integration: &mattermost.PostActionIntegration{
+											URL: "http://your-server.com/vote",
+											Context: map[string]interface{}{
+												"option": "go",
+											},
+										},
+									},
+									{
+										Name: "Python",
+										Type: "button",
+										Integration: &mattermost.PostActionIntegration{
+											URL: "http://your-server.com/vote",
+											Context: map[string]interface{}{
+												"option": "python",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+
+				_, _, err = app.Client.CreatePost(response)
+				if err != nil {
+					app.Logger.Error("Error while sending post", slog.Attr{
+						Key:   "error",
+						Value: slog.StringValue(err.Error()),
+					})
+				}
+			} else {
+				sendMsgToChan(app, "I see your event")
+			}
+			fmt.Printf("Event = %v\n", event.GetData())
+		}
 	}
 }
 
-// func sendMsgToTalkingChannel(app *application, msg string, replyToId string) {
-// 	// Note that replyToId should be empty for a new post.
-// 	// All replies in a thread should reply to root.
+func setupGracefulShutdown(app *application.Application) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		for range c {
+			if app.WebsocketClient != nil {
+				sendMsgToChan(app, "Bye!")
+				app.Logger.Info("Closing websocket connection")
+				app.WebsocketClient.Close()
+			}
+			app.Logger.Info("Shutting down")
+			os.Exit(0)
+		}
+	}()
+}
 
-// 	post := &model.Post{}
-// 	post.ChannelId = app.mattermostChannel.Id
-// 	post.Message = msg
+func sendMsgToChan(app *application.Application, msg string) {
+	post := &mattermost.Post{
+		ChannelId: app.Channel.Id,
+		Message:   msg,
+	}
+	if _, _, err := app.Client.CreatePost(post); err != nil {
+		app.Logger.Error("Could not send massage!",
+			slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			},
+			slog.String("Bot:", app.User.FirstName), slog.String("Team:", app.Config.MM_TEAM),
+			slog.String("Channel:", app.Config.MM_CHANNEL))
+	}
+	app.Logger.Debug("Massage was sended", slog.String("Massage:", msg),
+		slog.String("Bot:", app.User.FirstName), slog.String("Team:", app.Config.MM_TEAM),
+		slog.String("Channel:", app.Config.MM_CHANNEL))
+}
 
-// 	post.RootId = replyToId
+func registerSlashCommand(app *application.Application, trigger string) {
+	if checkCommandExist(app, trigger) {
+		return
+	}
+	command := &mattermost.Command{
+		TeamId:       app.Team.Id,
+		Trigger:      "pool",
+		Description:  "create a poll",
+		URL:          app.Config.MM_SERVER + "/pool",
+		Method:       mattermost.CommandMethodPost,
+		AutoComplete: true,
+	}
+	_, resp, err := app.Client.CreateCommand(command)
+	if err != nil {
+		app.Logger.Error("can not add command")
+	}
+	app.Logger.Info("command was seccessfully created", slog.String("command", command.Trigger),
+		slog.String("status code", strconv.Itoa(resp.StatusCode)))
+}
 
-// 	if _, _, err := app.mattermostClient.CreatePost(post); err != nil {
-// 		app.logger.Error().Err(err).Str("RootID", replyToId).Msg("Failed to create post")
-// 	}
-// }
+func checkCommandExist(app *application.Application, trigger string) bool {
+	commands, resp, err := app.Client.ListCommands(app.Team.Id, false)
+	if err != nil {
+		app.Logger.Error("error receiving commands", slog.Attr{
+			Key:   "error",
+			Value: slog.StringValue(err.Error()),
+		})
+		os.Exit(1)
+	}
+	for _, cmd := range commands {
+		if cmd.Trigger == trigger {
+			app.Logger.Info("command exists", slog.String("command", trigger),
+				slog.String("status code", strconv.Itoa(resp.StatusCode)))
+			return true
+		}
+	}
+	return false
+}

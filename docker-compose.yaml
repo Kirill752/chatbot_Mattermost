@@ -7,3 +7,16 @@ services:
     - "8065:8065"
     environment:
       MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
+      # 2. Явно разрешаем конкретные адреса
+      MM_SERVICESETTINGS_ALLOWEDUNTRUSTEDINTERNALCONNECTIONS: "host.docker.internal,localhost,127.0.0.1,app,172.19.0.1"
+      
+      # 3. Отключаем HTTPS проверку для локальных URL
+      MM_SERVICESETTINGS_ENABLESECUREINTERNALCONNECTION: "false"
+      
+      # 4. Для slash-команд добавляем:
+      MM_SERVICESETTINGS_ALLOWCORSFROM: "*"
+      
+      # 5. Указываем корректный URL сервера
+      MM_SERVICESETTINGS_SITEURL: "http://localhost:8065"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
