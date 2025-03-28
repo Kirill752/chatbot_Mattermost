@@ -8,8 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	storage "vk_tarantool/Internal/Storage"
 	"vk_tarantool/Internal/config"
 	"vk_tarantool/Internal/handlers/pool"
+	"vk_tarantool/Internal/handlers/vote"
 
 	mattermost "github.com/mattermost/mattermost-server/v6/model"
 )
@@ -21,13 +24,23 @@ type Application struct {
 	User            *mattermost.User
 	Channel         *mattermost.Channel
 	Team            *mattermost.Team
-	Logger          slog.Logger
+	Logger          *slog.Logger
+	DB              *storage.Storage
 }
 
 func New(configPath string) *Application {
 	app := &Application{
-		Logger: *slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
+	db, err := storage.New("127.0.0.1:3301", "storage", "passw0rd")
+	if err != nil {
+		app.Logger.Error("Could not init database", slog.Attr{
+			Key:   "error",
+			Value: slog.StringValue(err.Error()),
+		})
+		os.Exit(1)
+	}
+	app.DB = db
 	app.Logger.Info("starting application")
 	app.Logger.Debug("debug massages enabled")
 
@@ -104,39 +117,14 @@ func (app *Application) ListenToEvents() {
 
 		app.WebsocketClient.Listen()
 		for event := range app.WebsocketClient.EventChannel {
-			if event.GetBroadcast().ChannelId != app.Channel.Id {
-				continue
-			}
-			// Ignore other types of events.
-			if event.EventType() != mattermost.WebsocketEventPosted {
-				continue
-			}
-			p := &mattermost.Post{}
-			err := json.Unmarshal([]byte(event.GetData()["post"].(string)), &p)
+			err = app.HadleWebSocketEvent(event)
 			if err != nil {
-				app.Logger.Error("Error while marshaling post", slog.Attr{
+				app.Logger.Error("Error while procces event", slog.Attr{
 					Key:   "error",
 					Value: slog.StringValue(err.Error()),
 				})
+				app.sendMsgToChan("Sorry, somthing went wrong :(")
 			}
-			// Ignore messages sent by this bot itself.
-			if p.UserId == app.User.Id {
-				continue
-			}
-			// TODO: добавить обработку сообщения голосования
-			if pl, err := pool.Create(p.Message); err == nil {
-				resp := pl.MakeResponse(app.Channel.Id)
-				_, _, err = app.Client.CreatePost(resp)
-				if err != nil {
-					app.Logger.Error("Error while sending post", slog.Attr{
-						Key:   "error",
-						Value: slog.StringValue(err.Error()),
-					})
-				}
-			} else {
-				app.sendMsgToChan("I see your event")
-			}
-			fmt.Printf("Event = %v\n", event.GetData())
 		}
 	}
 }
@@ -150,6 +138,10 @@ func (app *Application) SetupGracefulShutdown() {
 				app.sendMsgToChan("Bye!")
 				app.Logger.Info("Closing websocket connection")
 				app.WebsocketClient.Close()
+			}
+			if app.DB != nil {
+				app.Logger.Info("Closing connection with data base")
+				app.DB.CloseConnection()
 			}
 			app.Logger.Info("Shutting down")
 			os.Exit(0)
@@ -174,4 +166,86 @@ func (app *Application) sendMsgToChan(msg string) {
 	app.Logger.Debug("Massage was sended", slog.String("Massage:", msg),
 		slog.String("Bot:", app.User.FirstName), slog.String("Team:", app.Config.MM_TEAM),
 		slog.String("Channel:", app.Config.MM_CHANNEL))
+}
+
+func (app *Application) HadleWebSocketEvent(event *mattermost.WebSocketEvent) error {
+	const op = "Internal.application.HadleWebSocketEvent"
+	if event.GetBroadcast().ChannelId != app.Channel.Id {
+		return nil
+	}
+	// Ignore other types of events.
+	if event.EventType() != mattermost.WebsocketEventPosted {
+		return nil
+	}
+	post := &mattermost.Post{}
+	err := json.Unmarshal([]byte(event.GetData()["post"].(string)), &post)
+	if err != nil {
+		app.Logger.Error("Error while marshaling post", slog.Attr{
+			Key:   "error",
+			Value: slog.StringValue(err.Error()),
+		})
+		app.sendMsgToChan("Sorry, I can not marshal your post...")
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	// Ignore messages sent by this bot itself.
+	if post.UserId == app.User.Id {
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(post.Message, "pool"):
+		err = app.HandleCreatePool(post)
+		if err != nil {
+			app.Logger.Error("Error while creating pool", slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+			return err
+		}
+	case strings.HasPrefix(post.Message, "vote"):
+		err = app.HandleVote(post)
+		if err != nil {
+			app.Logger.Error("Error while proccess vote", slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+			return err
+		}
+	}
+	app.Logger.Info("Event success", slog.Attr{
+		Key:   "Event",
+		Value: slog.AnyValue(event.GetData()),
+	})
+	return nil
+}
+
+func (app *Application) HandleCreatePool(post *mattermost.Post) error {
+	const op = "Internal.application.HandleCreatePool"
+	if pl, err := pool.Create(post.Message); err == nil {
+		err = app.DB.Save(pl)
+		if err != nil {
+			return fmt.Errorf("%s: unable to save pool in DB %w", op, err)
+		}
+		resp := pl.MakeResponse(app.Channel.Id)
+		_, _, err = app.Client.CreatePost(resp)
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+	} else {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
+}
+
+func (app *Application) HandleVote(post *mattermost.Post) error {
+	const op = "Internal.application.HandleVote"
+	if vt, err := vote.Create(post.Message); err == nil {
+		err = app.DB.AddVote(vt.PoolID, vt.Variant)
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+		app.sendMsgToChan(fmt.Sprintf("You vote for %s in pool with ID %d.\nThank you!", vt.Variant, vt.PoolID))
+	} else {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
 }

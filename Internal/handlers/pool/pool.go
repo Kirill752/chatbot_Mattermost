@@ -44,7 +44,6 @@ func (p *Pool) MakeResponse(channelId string) *mattermost.Post {
 // Format: /опрос [id] "[title]"  variant1, variant2, ...
 func Create(msg string) (*Pool, error) {
 	newPool := new(Pool)
-
 	rgx := regexp.MustCompile(`^\s*(?i)(?:pool|create\s+pool|опрос|cjplfq|создать\s+опрос)\s+([0-9]+)\s+"([^"]+)"\s+([^,]+(?:,\s*[^,]+)*)$`)
 	parts := rgx.FindStringSubmatch(msg)
 	if len(parts) < 4 {
