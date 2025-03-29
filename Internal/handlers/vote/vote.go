@@ -9,13 +9,9 @@ import (
 )
 
 type Vote struct {
-	PoolID         int
-	Variant        string
-	NumberOfVoters uint
-}
-
-func (v *Vote) String() string {
-	return fmt.Sprintf("id: %d\ntitle: %s\nNumberOfVoters%v", v.PoolID, v.Variant, v.NumberOfVoters)
+	PoolID  uint
+	UserId  string
+	Variant string
 }
 
 func (v *Vote) MakeResponse(channelId string) *mattermost.Post {
@@ -45,7 +41,6 @@ func Create(msg string) (*Vote, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: unable to parse pool id: %w", op, err)
 	}
-	newVote.PoolID = poolId
-	newVote.NumberOfVoters = 0
+	newVote.PoolID = uint(poolId)
 	return newVote, nil
 }

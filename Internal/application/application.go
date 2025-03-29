@@ -210,6 +210,33 @@ func (app *Application) HadleWebSocketEvent(event *mattermost.WebSocketEvent) er
 			})
 			return err
 		}
+	case strings.HasPrefix(post.Message, "view results"):
+		err = app.HandleResults(post)
+		if err != nil {
+			app.Logger.Error("Error while proccess results", slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+			return err
+		}
+	case strings.HasPrefix(post.Message, "finish"):
+		err = app.HandleFinish(post)
+		if err != nil {
+			app.Logger.Error("Error while proccess results", slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+			return err
+		}
+	case strings.HasPrefix(post.Message, "delete"):
+		err = app.HandleDelete(post)
+		if err != nil {
+			app.Logger.Error("Error while proccess results", slog.Attr{
+				Key:   "error",
+				Value: slog.StringValue(err.Error()),
+			})
+			return err
+		}
 	}
 	app.Logger.Info("Event success", slog.Attr{
 		Key:   "Event",
@@ -221,7 +248,8 @@ func (app *Application) HadleWebSocketEvent(event *mattermost.WebSocketEvent) er
 func (app *Application) HandleCreatePool(post *mattermost.Post) error {
 	const op = "Internal.application.HandleCreatePool"
 	if pl, err := pool.Create(post.Message); err == nil {
-		err = app.DB.Save(pl)
+		pl.Creator = post.UserId
+		err = app.DB.SavePool(pl)
 		if err != nil {
 			return fmt.Errorf("%s: unable to save pool in DB %w", op, err)
 		}
@@ -239,12 +267,81 @@ func (app *Application) HandleCreatePool(post *mattermost.Post) error {
 func (app *Application) HandleVote(post *mattermost.Post) error {
 	const op = "Internal.application.HandleVote"
 	if vt, err := vote.Create(post.Message); err == nil {
-		err = app.DB.AddVote(vt.PoolID, vt.Variant)
+		err = app.DB.AddVote(vt.PoolID, post.UserId, vt.Variant)
 		if err != nil {
 			return fmt.Errorf("%s: %w", op, err)
 		}
-		app.sendMsgToChan(fmt.Sprintf("You vote for %s in pool with ID %d.\nThank you!", vt.Variant, vt.PoolID))
+		app.sendMsgToChan(fmt.Sprintf("You vote for %s in pool with ID %d.\nThank you! :) ", vt.Variant, vt.PoolID))
 	} else {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
+}
+
+func (app *Application) HandleResults(post *mattermost.Post) error {
+	const op = "Internal.application.HandleResults"
+	req := strings.TrimSpace(post.Message)
+	req = strings.TrimPrefix(req, "view results")
+	req = strings.TrimSpace(req)
+	id, err := strconv.ParseUint(req, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	resp, err := app.DB.SelectPool(uint(id))
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	poll := resp.Data[0].([]any)
+	variants, ok := poll[3].(map[any]any)
+	if !ok {
+		return fmt.Errorf("%s: error type assertion %w", op, err)
+	}
+	var msg strings.Builder
+	msg.WriteString(fmt.Sprintf("Poll results (id: %v)\n", id))
+	for k, v := range variants {
+		msg.WriteString(fmt.Sprintf("%v: %v\n", k, v))
+	}
+	app.sendMsgToChan(msg.String())
+	return nil
+}
+
+func (app *Application) HandleFinish(post *mattermost.Post) error {
+	const op = "Internal.application.HandleFinish"
+	req := strings.TrimSpace(post.Message)
+	req = strings.TrimPrefix(req, "finish")
+	req = strings.TrimSpace(req)
+	id, err := strconv.ParseUint(req, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	err = app.DB.FinishPool(uint(id), post.UserId)
+	if err != nil {
+		if err.Error() == "not creator" {
+			app.sendMsgToChan("You are not a creator of this poll")
+			return nil
+		} else {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+	}
+	app.sendMsgToChan(fmt.Sprintf("Pool (id: %v) was finished", id))
+	return nil
+}
+
+func (app *Application) HandleDelete(post *mattermost.Post) error {
+	const op = "Internal.application.HandleFinish"
+	req := strings.TrimSpace(post.Message)
+	req = strings.TrimPrefix(req, "delete")
+	req = strings.TrimSpace(req)
+	id, err := strconv.ParseUint(req, 10, 64)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	err = app.DB.DeleteAllVotes(uint(id))
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	err = app.DB.DeletePool(uint(id))
+	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 	return nil

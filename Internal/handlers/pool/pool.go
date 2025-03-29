@@ -10,9 +10,11 @@ import (
 )
 
 type Pool struct {
-	ID       int      `json:"id"`
-	Title    string   `json:"title"`
-	Variants []string `json:"variants"`
+	ID       int
+	Title    string
+	Creator  string
+	Variants []string
+	Finished bool
 }
 
 func (p *Pool) String() string {
